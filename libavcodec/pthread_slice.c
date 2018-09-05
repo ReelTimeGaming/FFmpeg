@@ -138,6 +138,10 @@ int ff_slice_thread_init(AVCodecContext *avctx)
         avctx->height > 2800)
         thread_count = avctx->thread_count = 1;
 
+#if HAVE_W32THREADS
+    w32thread_init();
+#endif
+
     if (!thread_count) {
         int nb_cpus = av_cpu_count();
         if  (avctx->height)

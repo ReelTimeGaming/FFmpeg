@@ -50,8 +50,6 @@ version 4.0:
 - nsp demuxer
 - support LibreSSL (via libtls)
 - AVX-512/ZMM support added
-- Dropped support for building for Windows XP. The minimum supported Windows
-  version is Windows Vista.
 - deconvolve video filter
 - entropy video filter
 - hilbert audio filter source
