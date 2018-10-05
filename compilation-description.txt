@@ -1,0 +1,6 @@
+This source code was compiled on a Windows 10 machine (but with bcrypt.h hidden to help emulate Windows XP conditions),
+using Msys1 with MingW32 (mingw-w64, i686-8.1.0-posix-dwarf-rt_v6-rev0), with the following configuration command:
+LDFLAGS="$LDFLAGS -static-libgcc" ./configure --extra-cflags="-static" --enable-libvpx --enable-dxva2 --enable-shared
+
+Where `LDFLAGS="$LDFLAGS -static-libgcc"` is used to remove the dependence upon `libgcc_s_dw2-1.dll`
+and `-static` to remove the dependence upon `libwinpthread-1.dll`.

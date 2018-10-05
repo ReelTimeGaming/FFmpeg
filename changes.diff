@@ -1,0 +1,461 @@
+diff --git a/Changelog b/Changelog
+index 0975feef3d..53d152a0f8 100644
+--- a/Changelog
++++ b/Changelog
+@@ -50,8 +50,6 @@ version 4.0:
+ - nsp demuxer
+ - support LibreSSL (via libtls)
+ - AVX-512/ZMM support added
+-- Dropped support for building for Windows XP. The minimum supported Windows
+-  version is Windows Vista.
+ - deconvolve video filter
+ - entropy video filter
+ - hilbert audio filter source
+diff --git a/compat/w32pthreads.h b/compat/w32pthreads.h
+index 21acfd2ba1..42a6553bc5 100644
+--- a/compat/w32pthreads.h
++++ b/compat/w32pthreads.h
+@@ -39,6 +39,11 @@
+ #include <windows.h>
+ #include <process.h>
+ 
++#if _WIN32_WINNT < 0x0600 && defined(__MINGW32__)
++#undef MemoryBarrier
++#define MemoryBarrier __sync_synchronize
++#endif
++
+ #include "libavutil/attributes.h"
+ #include "libavutil/common.h"
+ #include "libavutil/internal.h"
+@@ -51,15 +56,24 @@ typedef struct pthread_t {
+     void *ret;
+ } pthread_t;
+ 
+-/* use light weight mutex/condition variable API for Windows Vista and later */
+-typedef SRWLOCK pthread_mutex_t;
+-typedef CONDITION_VARIABLE pthread_cond_t;
++/* the conditional variable api for windows 6.0+ uses critical sections and
++ * not mutexes */
++typedef CRITICAL_SECTION pthread_mutex_t;
+ 
+-#define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT
+-#define PTHREAD_COND_INITIALIZER CONDITION_VARIABLE_INIT
++/* This is the CONDITION_VARIABLE typedef for using Windows' native
++ * conditional variables on kernels 6.0+. */
++#if HAVE_CONDITION_VARIABLE_PTR
++typedef CONDITION_VARIABLE pthread_cond_t;
++#else
++typedef struct pthread_cond_t {
++    void *Ptr;
++} pthread_cond_t;
++#endif
+ 
++#if _WIN32_WINNT >= 0x0600
+ #define InitializeCriticalSection(x) InitializeCriticalSectionEx(x, 0, 0)
+ #define WaitForSingleObject(a, b) WaitForSingleObjectEx(a, b, FALSE)
++#endif
+ 
+ static av_unused unsigned __stdcall attribute_align_arg win32thread_worker(void *arg)
+ {
+@@ -100,25 +114,27 @@ static av_unused int pthread_join(pthread_t thread, void **value_ptr)
+ 
+ static inline int pthread_mutex_init(pthread_mutex_t *m, void* attr)
+ {
+-    InitializeSRWLock(m);
++    InitializeCriticalSection(m);
+     return 0;
+ }
+ static inline int pthread_mutex_destroy(pthread_mutex_t *m)
+ {
+-    /* Unlocked SWR locks use no resources */
++    DeleteCriticalSection(m);
+     return 0;
+ }
+ static inline int pthread_mutex_lock(pthread_mutex_t *m)
+ {
+-    AcquireSRWLockExclusive(m);
++    EnterCriticalSection(m);
+     return 0;
+ }
+ static inline int pthread_mutex_unlock(pthread_mutex_t *m)
+ {
+-    ReleaseSRWLockExclusive(m);
++    LeaveCriticalSection(m);
+     return 0;
+ }
+ 
++#if _WIN32_WINNT >= 0x0600
++
+ typedef INIT_ONCE pthread_once_t;
+ #define PTHREAD_ONCE_INIT INIT_ONCE_STATIC_INIT
+ 
+@@ -152,14 +168,247 @@ static inline int pthread_cond_broadcast(pthread_cond_t *cond)
+ 
+ static inline int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
+ {
+-    SleepConditionVariableSRW(cond, mutex, INFINITE, 0);
++    SleepConditionVariableCS(cond, mutex, INFINITE);
+     return 0;
+ }
+ 
+ static inline int pthread_cond_signal(pthread_cond_t *cond)
+ {
+     WakeConditionVariable(cond);
++}
++
++#else // _WIN32_WINNT < 0x0600
++
++/* atomic init state of dynamically loaded functions */
++static LONG w32thread_init_state = 0;
++static av_unused void w32thread_init(void);
++
++/* for pre-Windows 6.0 platforms, define INIT_ONCE struct,
++ * compatible to the one used in the native API */
++
++typedef union pthread_once_t  {
++    void * Ptr;    ///< For the Windows 6.0+ native functions
++    LONG state;    ///< For the pre-Windows 6.0 compat code
++} pthread_once_t;
++
++#define PTHREAD_ONCE_INIT {0}
++
++/* function pointers to init once API on windows 6.0+ kernels */
++static BOOL (WINAPI *initonce_begin)(pthread_once_t *lpInitOnce, DWORD dwFlags, BOOL *fPending, void **lpContext);
++static BOOL (WINAPI *initonce_complete)(pthread_once_t *lpInitOnce, DWORD dwFlags, void *lpContext);
++
++/* pre-Windows 6.0 compat using a spin-lock */
++static inline void w32thread_once_fallback(LONG volatile *state, void (*init_routine)(void))
++{
++    switch (InterlockedCompareExchange(state, 1, 0)) {
++    /* Initial run */
++    case 0:
++        init_routine();
++        InterlockedExchange(state, 2);
++        break;
++    /* Another thread is running init */
++    case 1:
++        while (1) {
++            MemoryBarrier();
++            if (*state == 2)
++                break;
++            Sleep(0);
++        }
++        break;
++    /* Initialization complete */
++    case 2:
++        break;
++    }
++}
++
++static av_unused int pthread_once(pthread_once_t *once_control, void (*init_routine)(void))
++{
++    w32thread_once_fallback(&w32thread_init_state, w32thread_init);
++
++    /* Use native functions on Windows 6.0+ */
++    if (initonce_begin && initonce_complete) {
++        BOOL pending = FALSE;
++        initonce_begin(once_control, 0, &pending, NULL);
++        if (pending)
++            init_routine();
++        initonce_complete(once_control, 0, NULL);
++        return 0;
++    }
++
++    w32thread_once_fallback(&once_control->state, init_routine);
+     return 0;
+ }
+ 
+-#endif /* COMPAT_W32PTHREADS_H */
++/* for pre-Windows 6.0 platforms we need to define and use our own condition
++ * variable and api */
++
++typedef struct  win32_cond_t {
++    pthread_mutex_t mtx_broadcast;
++    pthread_mutex_t mtx_waiter_count;
++    volatile int waiter_count;
++    HANDLE semaphore;
++    HANDLE waiters_done;
++    volatile int is_broadcast;
++} win32_cond_t;
++
++/* function pointers to conditional variable API on windows 6.0+ kernels */
++static void (WINAPI *cond_broadcast)(pthread_cond_t *cond);
++static void (WINAPI *cond_init)(pthread_cond_t *cond);
++static void (WINAPI *cond_signal)(pthread_cond_t *cond);
++static BOOL (WINAPI *cond_wait)(pthread_cond_t *cond, pthread_mutex_t *mutex,
++                                DWORD milliseconds);
++
++static av_unused void pthread_cond_init(pthread_cond_t *cond, const void *unused_attr)
++{
++    win32_cond_t *win32_cond = NULL;
++
++    w32thread_once_fallback(&w32thread_init_state, w32thread_init);
++
++    if (cond_init) {
++        cond_init(cond);
++        return;
++    }
++
++    /* non native condition variables */
++    win32_cond = av_mallocz(sizeof(win32_cond_t));
++    if (!win32_cond)
++        return;
++    cond->Ptr = win32_cond;
++    win32_cond->semaphore = CreateSemaphore(NULL, 0, 0x7fffffff, NULL);
++    if (!win32_cond->semaphore)
++        return;
++    win32_cond->waiters_done = CreateEvent(NULL, TRUE, FALSE, NULL);
++    if (!win32_cond->waiters_done)
++        return;
++
++    pthread_mutex_init(&win32_cond->mtx_waiter_count, NULL);
++    pthread_mutex_init(&win32_cond->mtx_broadcast, NULL);
++}
++
++static av_unused void pthread_cond_destroy(pthread_cond_t *cond)
++{
++    win32_cond_t *win32_cond = cond->Ptr;
++    /* native condition variables do not destroy */
++    if (cond_init)
++        return;
++
++    /* non native condition variables */
++    CloseHandle(win32_cond->semaphore);
++    CloseHandle(win32_cond->waiters_done);
++    pthread_mutex_destroy(&win32_cond->mtx_waiter_count);
++    pthread_mutex_destroy(&win32_cond->mtx_broadcast);
++    av_freep(&win32_cond);
++    cond->Ptr = NULL;
++}
++
++static av_unused void pthread_cond_broadcast(pthread_cond_t *cond)
++{
++    win32_cond_t *win32_cond = cond->Ptr;
++    int have_waiter;
++
++    if (cond_broadcast) {
++        cond_broadcast(cond);
++        return;
++    }
++
++    /* non native condition variables */
++    pthread_mutex_lock(&win32_cond->mtx_broadcast);
++    pthread_mutex_lock(&win32_cond->mtx_waiter_count);
++    have_waiter = 0;
++
++    if (win32_cond->waiter_count) {
++        win32_cond->is_broadcast = 1;
++        have_waiter = 1;
++    }
++
++    if (have_waiter) {
++        ReleaseSemaphore(win32_cond->semaphore, win32_cond->waiter_count, NULL);
++        pthread_mutex_unlock(&win32_cond->mtx_waiter_count);
++        WaitForSingleObject(win32_cond->waiters_done, INFINITE);
++        ResetEvent(win32_cond->waiters_done);
++        win32_cond->is_broadcast = 0;
++    } else
++        pthread_mutex_unlock(&win32_cond->mtx_waiter_count);
++    pthread_mutex_unlock(&win32_cond->mtx_broadcast);
++}
++
++static av_unused int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
++{
++    win32_cond_t *win32_cond = cond->Ptr;
++    int last_waiter;
++    if (cond_wait) {
++        cond_wait(cond, mutex, INFINITE);
++        return 0;
++    }
++
++    /* non native condition variables */
++    pthread_mutex_lock(&win32_cond->mtx_broadcast);
++    pthread_mutex_lock(&win32_cond->mtx_waiter_count);
++    win32_cond->waiter_count++;
++    pthread_mutex_unlock(&win32_cond->mtx_waiter_count);
++    pthread_mutex_unlock(&win32_cond->mtx_broadcast);
++
++    // unlock the external mutex
++    pthread_mutex_unlock(mutex);
++    WaitForSingleObject(win32_cond->semaphore, INFINITE);
++
++    pthread_mutex_lock(&win32_cond->mtx_waiter_count);
++    win32_cond->waiter_count--;
++    last_waiter = !win32_cond->waiter_count || !win32_cond->is_broadcast;
++    pthread_mutex_unlock(&win32_cond->mtx_waiter_count);
++
++    if (last_waiter)
++        SetEvent(win32_cond->waiters_done);
++
++    // lock the external mutex
++    return pthread_mutex_lock(mutex);
++}
++
++static av_unused void pthread_cond_signal(pthread_cond_t *cond)
++{
++    win32_cond_t *win32_cond = cond->Ptr;
++    int have_waiter;
++    if (cond_signal) {
++        cond_signal(cond);
++        return;
++    }
++
++    pthread_mutex_lock(&win32_cond->mtx_broadcast);
++
++    /* non-native condition variables */
++    pthread_mutex_lock(&win32_cond->mtx_waiter_count);
++    have_waiter = win32_cond->waiter_count;
++    pthread_mutex_unlock(&win32_cond->mtx_waiter_count);
++
++    if (have_waiter) {
++        ReleaseSemaphore(win32_cond->semaphore, 1, NULL);
++        WaitForSingleObject(win32_cond->waiters_done, INFINITE);
++        ResetEvent(win32_cond->waiters_done);
++    }
++
++    pthread_mutex_unlock(&win32_cond->mtx_broadcast);
++}
++#endif
++
++static av_unused void w32thread_init(void)
++{
++#if _WIN32_WINNT < 0x0600
++    HANDLE kernel_dll = GetModuleHandle(TEXT("kernel32.dll"));
++    /* if one is available, then they should all be available */
++    cond_init      = (void (WINAPI*)(pthread_cond_t *))
++        GetProcAddress(kernel_dll, "InitializeConditionVariable");
++    cond_broadcast = (void (WINAPI*)(pthread_cond_t *))
++        GetProcAddress(kernel_dll, "WakeAllConditionVariable");
++    cond_signal    = (void (WINAPI*)(pthread_cond_t *))
++        GetProcAddress(kernel_dll, "WakeConditionVariable");
++    cond_wait      = (BOOL (WINAPI*)(pthread_cond_t *, pthread_mutex_t *, DWORD))
++        GetProcAddress(kernel_dll, "SleepConditionVariableCS");
++    initonce_begin = (BOOL (WINAPI*)(pthread_once_t *, DWORD, BOOL *, void **))
++        GetProcAddress(kernel_dll, "InitOnceBeginInitialize");
++    initonce_complete = (BOOL (WINAPI*)(pthread_once_t *, DWORD, void *))
++        GetProcAddress(kernel_dll, "InitOnceComplete");
++#endif
++
++}
++
++#endif /* LIBAV_COMPAT_W32PTHREADS_H */
+diff --git a/configure b/configure
+index 3cf9412947..f0f4a44280 100755
+--- a/configure
++++ b/configure
+@@ -2208,7 +2208,8 @@ TOOLCHAIN_FEATURES="
+ "
+ 
+ TYPES_LIST="
+-    kCMVideoCodecType_HEVC
++    CONDITION_VARIABLE_Ptr
++    CUVIDDECODECREATEINFO_bitDepthMinus8
+     socklen_t
+     struct_addrinfo
+     struct_group_source_req
+@@ -5375,8 +5376,6 @@ probe_libc(){
+         add_${pfx}cppflags -U__STRICT_ANSI__ -D__USE_MINGW_ANSI_STDIO=1
+         eval test \$${pfx_no_}cc_type = "gcc" &&
+             add_${pfx}cppflags -D__printf__=__gnu_printf__
+-        test_${pfx}cpp_condition windows.h "!defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0600" &&
+-            add_${pfx}cppflags -D_WIN32_WINNT=0x0600
+     elif test_${pfx}cpp_condition _mingw.h "defined __MINGW_VERSION"  ||
+          test_${pfx}cpp_condition _mingw.h "defined __MINGW32_VERSION"; then
+         eval ${pfx}libc_type=mingw32
+@@ -5386,8 +5385,8 @@ probe_libc(){
+         add_${pfx}cppflags -U__STRICT_ANSI__ -D__USE_MINGW_ANSI_STDIO=1
+         test_${pfx}cpp_condition _mingw.h "__MSVCRT_VERSION__ < 0x0700" &&
+             add_${pfx}cppflags -D__MSVCRT_VERSION__=0x0700
+-        test_${pfx}cpp_condition windows.h "!defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0600" &&
+-            add_${pfx}cppflags -D_WIN32_WINNT=0x0600
++        test_${pfx}cpp_condition windows.h "defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0502" &&
++            add_${pfx}cppflags -D_WIN32_WINNT=0x0502
+         eval test \$${pfx_no_}cc_type = "gcc" &&
+             add_${pfx}cppflags -D__printf__=__gnu_printf__
+     elif test_${pfx}cpp_condition crtversion.h "defined _VC_CRT_MAJOR_VERSION"; then
+@@ -5407,14 +5406,14 @@ probe_libc(){
+         # 0x601 by default unless something else is set by the user.
+         # This can easily lead to us detecting functions only present
+         # in such new versions and producing binaries requiring windows 7.0.
+-        # Therefore explicitly set the default to Vista unless the user has
++        # Therefore explicitly set the default to XP unless the user has
+         # set something else on the command line.
+         # Don't do this if WINAPI_FAMILY is set and is set to a non-desktop
+         # family. For these cases, configure is free to use any functions
+         # found in the SDK headers by default. (Alternatively, we could force
+         # _WIN32_WINNT to 0x0602 in that case.)
+         test_${pfx}cpp_condition stdlib.h "defined(_WIN32_WINNT)" ||
+-            { test_${pfx}cpp <<EOF && add_${pfx}cppflags -D_WIN32_WINNT=0x0600; }
++            { test_${pfx}cpp <<EOF && add_${pfx}cppflags -D_WIN32_WINNT=0x0502; }
+ #ifdef WINAPI_FAMILY
+ #include <winapifamily.h>
+ #if !WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+@@ -5871,6 +5870,7 @@ check_func_headers windows.h VirtualAlloc
+ check_func_headers glob.h glob
+ enabled xlib &&
+     check_lib xlib "X11/Xlib.h X11/extensions/Xvlib.h" XvGetPortAttribute -lXv -lX11 -lXext
++check_struct windows.h "CONDITION_VARIABLE" Ptr
+ 
+ check_header direct.h
+ check_header dirent.h
+@@ -5963,14 +5963,7 @@ fi
+ check_cpp_condition winrt windows.h "!WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)"
+ 
+ if ! disabled w32threads && ! enabled pthreads; then
+-    check_func_headers "windows.h process.h" _beginthreadex &&
+-        check_type "windows.h" CONDITION_VARIABLE &&
+-        check_type "windows.h" INIT_ONCE &&
+-        enable w32threads || disable w32threads
+-    if ! enabled w32threads && enabled winrt; then
+-        check_func_headers "windows.h" CreateThread &&
+-            enable w32threads || disable w32threads
+-    fi
++    check_func_headers "windows.h process.h" _beginthreadex
+ fi
+ 
+ # check for some common methods of building with pthread support
+diff --git a/libavcodec/pthread_frame.c b/libavcodec/pthread_frame.c
+index 5104b1beba..62a8449ccc 100644
+--- a/libavcodec/pthread_frame.c
++++ b/libavcodec/pthread_frame.c
+@@ -728,6 +728,10 @@ int ff_frame_thread_init(AVCodecContext *avctx)
+     FrameThreadContext *fctx;
+     int i, err = 0;
+ 
++#if HAVE_W32THREADS
++    w32thread_init();
++#endif
++
+     if (!thread_count) {
+         int nb_cpus = av_cpu_count();
+ #if FF_API_DEBUG_MV
+diff --git a/libavcodec/pthread_slice.c b/libavcodec/pthread_slice.c
+index 77cfe3c9f6..d6a0bf06cf 100644
+--- a/libavcodec/pthread_slice.c
++++ b/libavcodec/pthread_slice.c
+@@ -138,6 +138,10 @@ int ff_slice_thread_init(AVCodecContext *avctx)
+         avctx->height > 2800)
+         thread_count = avctx->thread_count = 1;
+ 
++#if HAVE_W32THREADS
++    w32thread_init();
++#endif
++
+     if (!thread_count) {
+         int nb_cpus = av_cpu_count();
+         if  (avctx->height)
+diff --git a/libavfilter/pthread.c b/libavfilter/pthread.c
+index 7e37c73ca3..567dd4c178 100644
+--- a/libavfilter/pthread.c
++++ b/libavfilter/pthread.c
+@@ -85,6 +85,10 @@ int ff_graph_thread_init(AVFilterGraph *graph)
+ {
+     int ret;
+ 
++#if HAVE_W32THREADS
++    w32thread_init();
++#endif
++
+     if (graph->nb_threads == 1) {
+         graph->thread_type = 0;
+         return 0;
